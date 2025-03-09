@@ -1,4 +1,6 @@
 # 1. Introduce.
+THIS IS A MODIFIED VERSION OF THE SOURCE CODE TO SEND LORA PACKET'S OVER MQTT 
+
 SX1301/SX1302/SX1308 LoRaWAN concentrator driver. For devices:
 - Armbian Platform: HP0A, HP0C, LPS8v2. 
 - Raspberry Pi Platform: HP0D

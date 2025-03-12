@@ -1,0 +1,227 @@
+#!/usr/bin/haserl
+
+<%  echo -en "content-type: text/html\r\n\r\n"  # RF2616 Compliance %>
+
+<%# --- Process the form submission --- %>
+<%
+	if [ "$FORM_BUTTON" == "Save" ] || [ "$FORM_BUTTON" == "Save&Apply" ]; then
+
+		uci set network.cellular.apn="$FORM_APN"
+		uci set network.cellular.dialnumber="$FORM_DIALNUMBER"
+		uci set network.cellular.service="$FORM_SERVICE"
+		uci set network.cellular.pincode="$FORM_PINCODE"
+		uci set network.cellular.username="$FORM_USER"
+		uci set network.cellular.password="$FORM_PASS"
+				
+		if [ "$FORM_CELL_BACKUP" == "checked" ]; then
+			uci set network.cellular.backup="1"
+			uci set network.cellular.metric="200"
+		else
+			uci set network.cellular.backup="0"
+			uci set network.cellular.metric="0"
+		fi
+
+		uci commit network
+	fi
+
+	if [ "$FORM_BUTTON" == "Save&Apply" ]; then
+		# Set up Cellular WAN 
+		if [ "$FORM_CELL_ENABLE" == "checked" ]; then
+			uci set network.cellular.auto="1"
+		else
+			uci set network.cellular.auto="0"
+		fi
+		uci commit network
+		
+    # Run in background    
+		#(sleep 1; /etc/init.d/network restart) &
+		#(sleep 20; /etc/init.d/fallbackip start) &
+		/etc/init.d/network reload
+		sleep 5;
+
+		comgt -d /dev/ttyUSB3 > /tmp/celltmp.txt
+  	fi
+%>
+
+<%# --- Get the variables for the HTML page --- %>
+<% 
+  apn="$(uci -q get network.cellular.apn)"
+  dialnumber="$(uci -q get network.cellular.dialnumber)"
+  service="$(uci -q get network.cellular.service)"
+  pincode="$(uci -q get network.cellular.pincode)"
+  user="$(uci -q get network.cellular.username)"
+  pass="$(uci -q get network.cellular.password)"
+  model=`cat /var/iot/model.txt`
+  
+  cell_enable="0"
+  cell_disabled="$(uci -q get network.cellular.auto)"
+  if [ "$cell_disabled" == "0" ]; then
+  	cell_enable="0"
+  else
+  	cell_enable="checked"
+  fi
+  
+  cell_backup=$(uci -q get network.cellular.backup)
+  if [ "$cell_backup" == "1" ]; then
+  	cell_backup="checked"
+  fi
+  
+	if [ `cat /sys/kernel/debug/usb/devices | grep "Vendor=1e0e ProdID=9011" -c` == "1" ]; then
+		echo 1 > /tmp/cell_detect.txt	
+	elif [ `cat /sys/kernel/debug/usb/devices | grep "Vendor=2c7c ProdID=0125" -c` == "1" ]; then
+		echo 1 > /tmp/cell_detect.txt
+		if [ ! -f /tmp/cell_imei.txt ]; then
+			IMEI=$(gcom -d /dev/ttyUSB3 -s /etc/gcom/getimei.gcom  |awk 'NR==2{print$1}')
+			if [ ! -z $IMEI ] && [ $IMEI -eq $IMEI  ] 2>/dev/null; then
+				echo $IMEI > /tmp/cell_imei.txt
+			fi
+		else
+			IMEI=$(cat /tmp/cell_imei.txt)
+		fi
+
+		if [ ! -f /tmp/cell_iccid.txt ]; then
+			ICCID=$(gcom -d /dev/ttyUSB3 -s /etc/gcom/geticcid.gcom  |awk 'NR==2{print$2}')
+			if echo "$ICCID" | grep -qE '^[0-9A-Fa-f]+$'; then
+				echo $ICCID > /tmp/cell_iccid.txt
+			fi
+		else
+			ICCID=$(cat /tmp/cell_iccid.txt)
+		fi
+
+		if [ ! -f /tmp/cell_imsi.txt ]; then
+			IMSI=$(gcom -d /dev/ttyUSB3 -s /etc/gcom/getimsi.gcom)
+			if [ ! -z $IMSI ] && [ $IMSI -eq $IMSI ] 2>/dev/null; then
+				echo $IMSI > /tmp/cell_imsi.txt
+			fi
+		else
+			IMSI=$(cat /tmp/cell_imsi.txt)
+		fi
+	else
+		echo 0 > /tmp/cell_detect.txt
+	fi
+
+  cell_detect=$(cat /tmp/cell_detect.txt)
+%>
+
+<%# --- Present the HTML page --- %>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<%inc /www/cgi-bin/inc/head.inc %>
+</head>
+
+<body>
+<%inc /www/cgi-bin/inc/menu.inc %>
+<div class="page-container">
+<h2>Cellular Settings</h2>
+
+<form name="SYSTEM-CELL" id="SYSTEM-CELL" action="<% echo -n $SCRIPT_NAME %>" method="POST">
+	<table class=configTable>
+		<tr class="rowSpacer"><td colspan="20"></td></tr>  <!--Determines column widths-->
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="19">
+  <% if [ "$cell_detect" == "1" ]; then %>
+       		<input type="checkbox" name="CELL_ENABLE" value="checked" <% echo -n $cell_enable %> > <font size="4"> Enable Cellular WAN </font>
+  <% else %>
+		 <% if [ -f "/var/cell_poweroff.txt" ]; then %>
+			<span class="impact"> <% cat /var/cell_poweroff.txt  %> </span>
+		 <% else %>
+       		<span class="impact"> Cellular device not detected </span>
+		 <% fi %>	
+  <% fi %>
+			</td>
+		</tr>
+
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="19">
+  <% if [ "$cell_detect" == "1" ]; then %>
+       		<input type="checkbox" name="CELL_BACKUP" value="checked" <% echo -n $cell_backup %> > <font size="4"> Use Cellular as Backup WAN</font>
+  <% fi %>
+			</td>
+		</tr>
+		
+		<tr class="rowSpacer"><td colspan="20"></td></tr>  <!--Determines column widths-->
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="IMEI">IMSI</label></td>
+			<td colspan="3"><label for="IMEI"><% echo $IMSI %></label></td>
+		</tr>
+
+		<tr class="rowSpacer"><td colspan="20"></td></tr>  <!--Determines column widths-->
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="IMEI">IMEI</label></td>
+			<td colspan="3"><label for="IMEI"><% echo $IMEI %></label></td>
+		</tr>
+
+		<tr class="rowSpacer"><td colspan="20"></td></tr>  <!--Determines column widths-->
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="IMEI">ICCID</label></td>
+			<td colspan="3"><label for="IMEI"><% echo $ICCID %></label></td>
+		</tr>
+
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="APN"> APN </label></td>
+			<td colspan="6"><input type="text" name="APN" placeholder="Service Provider APN" maxlength="32" VALUE="<% echo -n $apn %>" ></td>
+		</tr>
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="SERVICE"> Service</label></td>
+			<td colspan="6"><SELECT name="SERVICE" id="service">
+				<option value="umts">UMTS / GPRS</option>
+				<option value="umts_only">UMTS</option>
+				<option value="gprs_only">GPRS</option>
+				<option value="evdo">CDMA/EVDO</option>
+				</SELECT></td>
+		</tr>
+
+		<script>document.getElementById("service").value="<% echo -n $service %>";</script>
+
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="DIALNUMBER"> Dial Number </label></td>
+			<td colspan="6"><input type="text" name="DIALNUMBER" placeholder="*99#" maxlength="32" VALUE="<% echo -n $dialnumber %>" ></td>
+		</tr>
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="PINCODE"> Pincode </label></td>
+			<td colspan="6"><input type="text" name="PINCODE" placeholder="SIM Pincode" maxlength="32" VALUE="<% echo -n $pincode %>" ></td>
+		</tr>
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="USER"> Username </label></td>
+			<td colspan="6"><input type="text" name="USER" placeholder="SIM Acct Username" maxlength="32" VALUE="<% echo -n $user %>" ></td>
+		</tr>
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="3"><label for="PASS"> Password </label></td>
+			<td colspan="6"><input type="password" name="PASS" id="pass" placeholder="SIM Acct Password" maxlength="32" VALUE="<% echo -n $pass %>" ></td>
+			<td colspan="1"><span class="btnShow" onclick="toggleVis('pass')">Show</span></td>
+		</tr>
+		<tr class="rowSpacer"></tr>
+		<tr class="rowSpacer"></tr>
+		<tr>
+			<td colspan="1"></td>
+			<td colspan="19">
+				<INPUT class="hiddenKey" TYPE="SUBMIT" name="BUTTON" VALUE="Save" accesskey="s"> 
+				<INPUT TYPE="SUBMIT" name="BUTTON" VALUE="Save&Apply" onclick="showPageLoaderIcon()">
+				<INPUT TYPE="SUBMIT" name="BUTTON" VALUE="Cancel" onclick="showPageLoaderIcon()">
+			</td>
+		</tr>
+	</table>
+</form>
+</div>
+</body>
+</html>
+
+

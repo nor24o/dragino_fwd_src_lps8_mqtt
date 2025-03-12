@@ -34,14 +34,25 @@
 #include <MQTTPacket.h>
 
 #include "fwd.h"
-#include "loragw_hal.h"
 
 #include "service.h"
 #include "mqtt_service.h"
 
+#include <sys/types.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>  // Needed for IFF_LOOPBACK flag
 
 #include <stdio.h>
 #include "gwcfg.h" // Ensure this is included to access the loaded structure
+
+
+#include <pthread.h>
+#include "loragw_hal.h"
+#include "jitqueue.h"
+
+
 
 
 
@@ -51,6 +62,229 @@ static int  payload_deal(mqttsession_s* session, struct lgw_pkt_rx_s* p);
 static void mqtt_init(serv_s* serv);
 static void mqtt_push_up(void* arg);       /* Thread: sends uplinks */
 static void check_internet(void* arg);     /* Thread: monitors connectivity */
+
+
+// Define a struct to hold MQTT downlink messages
+typedef struct {
+    char topicName[128];
+    char payload[512];  // Buffer to store raw JSON
+    int payloadlen;
+} downlink_message_t;
+
+// Extract an integer value from JSON manually
+int extract_int_value(const char *json, const char *key) {
+    char *pos = strstr(json, key);
+    if (!pos) return -1;
+
+    int value;
+    if (sscanf(pos + strlen(key) + 2, "%d", &value) == 1) {
+        return value;
+    }
+    return -1;
+}
+
+// Extract a boolean value from JSON
+bool extract_bool_value(const char *json, const char *key) {
+    char *pos = strstr(json, key);
+    if (!pos) return false;
+    return strstr(pos, "true") ? true : false;
+}
+
+// Extract a string value (HEX payload) from JSON
+int extract_string_value(const char *json, const char *key, char *output, int max_len) {
+    char *pos = strstr(json, key);
+    if (!pos) return -1;
+
+    pos = strchr(pos, ':');
+    if (!pos) return -1;
+    
+    pos = strchr(pos, '"');
+    if (!pos) return -1;
+    pos++;
+
+    char *end = strchr(pos, '"');
+    if (!end) return -1;
+
+    int len = end - pos;
+    if (len >= max_len) return -1;
+
+    strncpy(output, pos, len);
+    output[len] = '\0';
+    return len;
+}
+
+// Convert HEX string to binary
+int hex2bin(const char *hex, uint8_t *bin, int bin_size) {
+    int len = strlen(hex);
+    if (len % 2 != 0 || len / 2 > bin_size) return -1;
+
+    for (int i = 0; i < len / 2; i++) {
+        sscanf(&hex[i * 2], "%2hhx", &bin[i]);
+    }
+    return len / 2;
+}
+
+
+// Worker function to process the downlink message
+void* process_downlink(void* arg) {
+    downlink_message_t* msg = (downlink_message_t*)arg;
+    if (!msg) return NULL;
+
+    lgw_log(LOG_INFO, "[INFO~] Processing MQTT downlink: %s\n", msg->payload);
+
+    struct lgw_pkt_tx_s txpkt;
+    memset(&txpkt, 0, sizeof(txpkt));
+
+    // Parse JSON manually
+    txpkt.freq_hz = extract_int_value(msg->payload, "\"freq_hz\"");
+    int sf = extract_int_value(msg->payload, "\"sf\"");
+    int bw = extract_int_value(msg->payload, "\"bw\"");
+    int rf_chain = extract_int_value(msg->payload, "\"rf_chain\"");
+
+    txpkt.invert_pol = extract_bool_value(msg->payload, "\"invert_pol\"");
+    txpkt.rf_power = extract_int_value(msg->payload, "\"tx_power\"");
+
+    if (txpkt.freq_hz <= 0 || sf < 7 || sf > 12 || bw <= 0 || txpkt.rf_power <= 0) {
+        lgw_log(LOG_ERROR, "[ERROR~] Invalid or missing JSON fields in downlink message!\n");
+        free(msg);
+        return NULL;
+    }
+
+    // Map Spreading Factor (SF)
+    switch (sf) {
+        case 7: txpkt.datarate = DR_LORA_SF7; break;
+        case 8: txpkt.datarate = DR_LORA_SF8; break;
+        case 9: txpkt.datarate = DR_LORA_SF9; break;
+        case 10: txpkt.datarate = DR_LORA_SF10; break;
+        case 11: txpkt.datarate = DR_LORA_SF11; break;
+        case 12: txpkt.datarate = DR_LORA_SF12; break;
+    }
+
+    // Map Bandwidth
+    switch (bw) {
+        case 125000: txpkt.bandwidth = BW_125KHZ; break;
+        case 250000: txpkt.bandwidth = BW_250KHZ; break;
+        case 500000: txpkt.bandwidth = BW_500KHZ; break;
+        default:
+            lgw_log(LOG_ERROR, "[ERROR~] Invalid Bandwidth!\n");
+            free(msg);
+            return NULL;
+    }
+
+    //rf_chain switch
+    switch (rf_chain) {
+        case 0: 
+        txpkt.rf_chain = 0; 
+        break;
+        case 1: 
+        txpkt.rf_chain = 1; 
+        break;
+        default:
+        txpkt.rf_chain = 0;
+        break;
+    }
+
+
+    txpkt.tx_mode = IMMEDIATE;
+    //txpkt.rf_chain = 0;
+    txpkt.modulation = MOD_LORA;
+    txpkt.coderate = CR_LORA_4_5;
+    txpkt.preamble = 8;
+    txpkt.no_crc = false;
+    txpkt.no_header = false;
+
+    // Extract payload HEX string
+    char hex_payload[512] = {0};
+    if (extract_string_value(msg->payload, "\"payload\"", hex_payload, sizeof(hex_payload)) < 0) {
+        lgw_log(LOG_ERROR, "[ERROR~] Failed to extract payload!\n");
+        free(msg);
+        return NULL;
+    }
+
+    // Convert HEX payload to binary
+    uint8_t binary_payload[256];
+    int bin_len = hex2bin(hex_payload, binary_payload, sizeof(binary_payload));
+    if (bin_len < 2) {  // Ensure at least 2 bytes for device ID
+        lgw_log(LOG_ERROR, "[ERROR~] Invalid HEX payload!\n");
+        free(msg);
+        return NULL;
+    }
+
+    // Extract first 2 bytes as device ID
+    uint16_t device_id = (binary_payload[0] << 8) | binary_payload[1];
+
+    // Remove device ID bytes from payload
+    //memmove(binary_payload, binary_payload + 2, bin_len - 2);
+    //bin_len -= 2;
+
+    memcpy(txpkt.payload, binary_payload, bin_len);
+    txpkt.size = bin_len;
+
+    lgw_log(LOG_INFO, "[INFO~] Sending downlink to Device ID: 0x%04X\n", device_id);
+
+    uint32_t current_concentrator_time;
+#ifdef SX1302MOD
+    pthread_mutex_lock(&GW.hal.mx_concent);
+    lgw_get_instcnt(&current_concentrator_time);
+    pthread_mutex_unlock(&GW.hal.mx_concent);
+#else
+    get_concentrator_time(&current_concentrator_time);
+#endif
+
+    txpkt.count_us = current_concentrator_time + (500 * 1000);  // Add delay
+
+    // Add to JIT queue
+    enum jit_error_e jit_result = jit_enqueue(&GW.tx.jit_queue[txpkt.rf_chain], current_concentrator_time, &txpkt, JIT_PKT_TYPE_DOWNLINK_CLASS_C);
+    
+    if (jit_result != JIT_ERROR_OK) {
+        lgw_log(LOG_ERROR, "[ERROR~] JIT queue error %d, cannot schedule downlink!\n", jit_result);
+    } else {
+        lgw_log(LOG_INFO, "[INFO~] Packet added to JIT queue for transmission!\n");
+    }
+
+    free(msg);
+    return NULL;
+}
+
+
+
+// Function to get the current IP address
+// Function to get the IP address of a specific interface (e.g., eth1)
+static void get_ip_address(char *ip_buffer, size_t buffer_size) {
+    struct ifaddrs *ifaddr, *ifa;
+    void *addr_ptr = NULL;
+    char temp_ip[INET_ADDRSTRLEN] = "Unknown"; // Default if no valid IP found
+    const char *target_interface = "eth1";    // Change this to your desired interface
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        strncpy(ip_buffer, "Unknown", buffer_size);
+        return;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+
+        // Ensure we only pick the correct interface
+        if (strcmp(ifa->ifa_name, target_interface) != 0) {
+            continue;
+        }
+
+        // Only pick IPv4 addresses
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+            inet_ntop(AF_INET, addr_ptr, temp_ip, sizeof(temp_ip));
+            break;  // Stop once we find the correct IP
+        }
+    }
+
+    freeifaddrs(ifaddr);
+
+    // Copy the selected IP to the output buffer
+    strncpy(ip_buffer, temp_ip, buffer_size);
+}
+
+
 
 static void mqtt_cleanup(mqttsession_s* session) {
     MQTTClientDestroy(&session->client);
@@ -65,6 +299,44 @@ static int mqtt_sendping(mqttsession_s *session) {
 static long mqtt_getrtt(mqttsession_s *session) {
     return MQTTGetPingTime(&session->client) / 1000;
 }
+
+static void mqtt_dnlink_cb(struct MessageData *data, void* s) {
+
+    mqttsession_s* session = (mqttsession_s*)s;
+
+    if (data->message->payloadlen < 0)
+        return;
+
+    if (session->dnlink_handler)
+        session->dnlink_handler(data);
+}
+
+void dnlink_handler(MessageData* data) {
+    if (!data || !data->message || !data->message->payload) {
+        lgw_log(LOG_ERROR, "[ERROR~] Received NULL or invalid data!\n");
+        return;
+    }
+
+    pthread_t downlink_thread;
+    downlink_message_t* msg = (downlink_message_t*)malloc(sizeof(downlink_message_t));
+    if (!msg) {
+        lgw_log(LOG_ERROR, "[ERROR~] Memory allocation failed!\n");
+        return;
+    }
+    memset(msg, 0, sizeof(downlink_message_t));
+
+    strncpy(msg->topicName, data->topicName, sizeof(msg->topicName) - 1);
+    memcpy(msg->payload, data->message->payload, data->message->payloadlen);
+    msg->payload[data->message->payloadlen] = '\0';
+    msg->payloadlen = data->message->payloadlen;
+
+    if (pthread_create(&downlink_thread, NULL, process_downlink, msg) != 0) {
+        free(msg);
+    } else {
+        pthread_detach(downlink_thread);
+    }
+}
+
 
 
 /* Connect to the MQTT broker */
@@ -110,6 +382,15 @@ static int mqtt_connect(serv_s *serv) {
     serv->state.live       = true;
     serv->state.stall_time = 0;
     serv->state.connecting = true;
+
+    //Subscribe to the downlink topic
+    if (session->dnlink_topic)
+        err = MQTTSubscribe(&session->client, session->dnlink_topic, QOS_DOWN, &mqtt_dnlink_cb, session);
+        printf("mqtt ---------------------------------------- dnlink topic: %s\n", session->dnlink_topic);
+    if (err != SUCCESS) {
+         printf("[WARNING][%s] -------------------------- MQTTSubscribe failed (err=%d).\n", serv->info.name, err);
+        //goto exit;
+    }
 
     /* Optionally update DB entry */
     snprintf(family, sizeof(family), "service/mqtt/%s", serv->info.name);
@@ -191,6 +472,8 @@ static void mqtt_init(serv_s* serv){
     //mqttsession->id             = serv->info.name;
     mqttsession->key            = serv->net->mqtt->mqtt_pass;
     //mqttsession->key            = serv->info.key;
+    //mqtt handler
+    mqttsession->dnlink_handler = &dnlink_handler;
     mqttsession->read_buffer    = lgw_malloc(READ_BUFFER_SIZE);
     mqttsession->send_buffer    = lgw_malloc(SEND_BUFFER_SIZE);
     mqttsession->dnlink_topic   = serv->net->mqtt->dntopic;
@@ -217,16 +500,29 @@ static void mqtt_init(serv_s* serv){
 
 //send status to mqtt /like online with a timestamp every 30s so i know it's on and working on a differnet topic like status
 void send_status(mqttsession_s* session) {
+    static char last_ip[INET_ADDRSTRLEN] = "";
+    char current_ip[INET_ADDRSTRLEN];
+
+    get_ip_address(current_ip, sizeof(current_ip));
+
+    // Only update if the IP address has changed
+    if (strcmp(last_ip, current_ip) != 0) {
+        strncpy(last_ip, current_ip, sizeof(last_ip));
+    }
+
     time_t now;
     struct tm *timeinfo;
     char buffer[80];
 
     time(&now);
     timeinfo = localtime(&now);
-    strftime(buffer, 80, "%Y-%m-%d %H:%M:%S", timeinfo);
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
 
     char uplink[256];
-    snprintf(uplink, sizeof(uplink), "{\"status\":\"online\",\"timestamp\":\"%s\"}", buffer);
+    snprintf(uplink, sizeof(uplink), 
+             "{\"status\":\"online\",\"timestamp\":\"%s\",\"ip_address\":\"%s\"}", 
+             buffer, last_ip);
+
     mqtt_send_uplink(session, uplink, strlen(uplink), "status");
 }
 

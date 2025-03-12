@@ -53,6 +53,10 @@ static pthread_mutex_t mx_jit_queue = PTHREAD_MUTEX_INITIALIZER; /*!> control ac
 /*!> -------------------------------------------------------------------------- */
 /*!> --- PUBLIC FUNCTIONS DEFINITION ----------------------------------------- */
 
+//nor
+struct jit_queue_s jit_queue;
+
+
 bool jit_queue_is_full(struct jit_queue_s *queue) {
     bool result;
 

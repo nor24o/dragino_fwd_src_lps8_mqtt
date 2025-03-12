@@ -1,7 +1,20 @@
-# 1. Introduce.
-THIS IS A MODIFIED VERSION OF THE SOURCE CODE TO SEND LORA PACKET'S OVER MQTT 
+<style>
+r { color: Red }
+o { color: Orange }
+g { color: Green }
+</style>
 
-SX1301/SX1302/SX1308 LoRaWAN concentrator driver. For devices:
+
+# 1. Important.
+# <r>THIS IS A MODIFIED VERSION OF THE SOURCE CODE TO SEND LORA PACKET'S OVER MQTT </r>
+
+## <r> This package needs custom settings for the device aka for use again with TTN or other mode needs full restore </r>
+## <o>Device network is modified to be accessed from local network over ethernet port "Wifi does not work" files can be found in etc_config</o>
+
+
+
+
+SX1301/SX1302/SX1308 LoRaMQTT concentrator driver. For devices:
 - Armbian Platform: HP0A, HP0C, LPS8v2. 
 - Raspberry Pi Platform: HP0D
 - OpenWrt Platform: LG308, LG308N, LPS8, LPS8N, LIG16, DLOS8, DLOS8N.
@@ -12,50 +25,103 @@ SX1301/SX1302/SX1308 LoRaWAN concentrator driver. For devices:
 1. sudo apt install -y libsqlite3-dev
 2. sudo apt install -y libftdi1-dev
 
-## 2.1 For Debian Platform
+### 2.2 It compiles just for the mips procesoor using dragino-lede-18.06
+### https://github.com/dragino/openwrt_lede-18.06
 
-###Compile:
-1. Git Clone from: git clone https://github.com/dragino/dragino_fwd_src.git 
-2. Enter into dragino_fwd_src/src, type command: ./hp0z-make-deb.sh  c
-   the option 'c' mean you will compile for HP0C 
-   the option 'd' mean you will compile for HP0D 
-3. Wait until you get the *.deb package
-4. Run 'dpkg -i' for install 
-
-Reference Link: [Armbian Compile Instruction](http://wiki1.dragino.com/xwiki/bin/view/Main/Armbian%20OS%20instruction/#HHowtorecompileLoRaWANConcentratorDriver28dragino-fwdpackage29.)
+### Compilation can be done just for this package using this command "sudo make package/dragino_fwd_src/compile"
+### Or using this script what compiles and then sends the package to the target device and also open a console with the uploaded package on the host device 
+### "sudo sh compilps8.sh"
 
 
-## 2.2 For Raspberry Pi Platform
 
-### download the source: git clone https://github.com/dragino/dragino_fwd_src.git
+# 3. Mqtt commands and config :
+## 3.1 Config the config of the mqtt can be done only with WinScp acces to the device 
+## /etc/lora/local_config.json has to  be modified 
 
-make if with sx1301/sx1308
 ```
-cd dragino_fwd_src/src
-make clean
-./hp0z-make-deb.sh  r1
+{
+    "gateway_conf": {
+                 REST OF THE CONFIG HERE , 
+        "servers": [
+            {
+                "server_name": "MQTTTT",
+                "server_type": "mqtt",
+                "enable": "true",
+                "uptopic": "mqttUP",
+                "dntopic": "mqttDOWN",
+                "server_address": "192.168.1.8",
+                "serv_port_up": 1883,
+                "serv_port_down": 1700,
+                "time_interval": 30,
+				"mqtt_user": "admin",
+				"mqtt_pass": "admin",
+                "keepalive_interval": 30,
+                "push_timeout_ms": 100,
+                "pull_timeout_ms": 100,
+                "fport_filter": 0,
+                "devaddr_filter": 0,
+                "nwkid_filter": 0,
+                "forward_crc_valid": true,
+                "forward_crc_error": false,
+                "forward_crc_disabled": false
+            },
+            {
+                "server_name": "pkt_serv",
+                "server_type": "pkt",
+                "enable": "false"
+            }
+        ]
+    }
+}
 ```
 
-make if with sx1302
+## 3.2 MQTT command Publish and subscribe
+## 3.2.1 Publish - Topic
+## "mqttUP/ID" -> mqttUP/32
+### this topic forwards the received data by the concentrator to the mqtt host
+### the data received is in this format :
 ```
-cd dragino_fwd_src/src
-make clean
-./hp0z-make-deb.sh  r2
+ {"id":"133","rssi":-64,"snr":12.2,"frequency":867100000,"bandwidth":"BW125","spreading_factor":"SF9","coding_rate":"4/5","radio":"Radio 1 (868 MHz)","payload":"516700B6"}
+
+id
+rssi
+snr
+frecvency
+bandwith
+spreading_factor
+coding_rate
+radio
+payload
+```
+## "mqttUP/status"
+### this topic sends heartbeat and also current ip address to the mqtt host 
+### the data received is in this format :
+```
+{"status":"online","timestamp":"2025-03-12 06:12:16","ip_address":"192.168.1.30"}
+```
+## 3.2.2 Subscribe - Topic
+## "mqttDOWN" - Json format 
+### for sending donwlink payload :
+```
+{
+    "freq_hz": 867300000,
+    "rf_chain":0,
+    "sf": 7,
+    "bw": 125000,
+    "invert_pol": false,
+    "tx_power": 14,
+    "payload": "010248656C6C6F"  
+}
+freq_hz=device frecvency
+rf_chain= gateway rf radio 0 or 1 preferably the same as on what the data was send from 
+sf= device spreading factor
+bw= device bandwith works just on 125000
+invert_pol= device settings dependent current set up tipically off
+tx_power= 14 (max)
+payload= hex format payload 
 ```
 
-### After build succeed, install debian package . 
-```
-dpkg -i draginofwd-($board)_($version).deb
-```
-$board will be rasp301 or rasp302
-$version will be xxxx-xx-xx , which is current date.
-
-## 2.3 For OpenWrt Platform
-See [OpenWrt compile instruction](https://github.com/dragino/openwrt_lede-18.06#how-to-develop-a-c-software-before-build-the-image)
-
-
-
-# 3. History Before move to this github
+# 4. History Before move to this github
 ## 2021.12.16
 file: fwd/src/pkt_serv.c
 remove element from dn_list when size biger than 16
